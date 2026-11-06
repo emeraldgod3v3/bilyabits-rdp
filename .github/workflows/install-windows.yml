@@ -1,4 +1,4 @@
-name: Windows RDP Desktop
+name: Windows RDP and VNC Desktop
 
 on:
   workflow_dispatch:
@@ -24,7 +24,6 @@ jobs:
   desktop:
     runs-on: windows-2025
     timeout-minutes: 360
-
     defaults:
       run:
         shell: pwsh
@@ -34,10 +33,10 @@ jobs:
         env:
           PHONE_IP: ${{ inputs.phone_tailscale_ip }}
           SESSION_MINUTES: ${{ inputs.session_minutes }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           $phoneInput = ([string]$env:PHONE_IP).Trim()
           $phoneIP = $null
-
           if (-not [ipaddress]::TryParse($phoneInput, [ref]$phoneIP) -or
               $phoneIP.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
               $phoneIP.ToString() -ne $phoneInput) {
@@ -45,21 +44,21 @@ jobs:
           }
 
           $octets = $phoneIP.GetAddressBytes()
-          if ($octets[0] -ne 100 -or
-              $octets[1] -lt 64 -or
-              $octets[1] -gt 127) {
+          if ($octets[0] -ne 100 -or $octets[1] -lt 64 -or $octets[1] -gt 127) {
             throw 'Use your phone Tailscale address in the 100.64.0.0/10 range.'
           }
 
           $minutes = 0
           if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$minutes) -or
-              $minutes -lt 5 -or
-              $minutes -gt 360) {
+              $minutes -lt 5 -or $minutes -gt 360) {
             throw 'Enter a whole number from 5 to 360.'
           }
 
-          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(355)
+          if ($env:VNC_PASSWORD -cnotmatch '\A[A-Za-z0-9]{8}\z') {
+            throw 'Set VNC_PASSWORD to exactly 8 random ASCII letters or numbers.'
+          }
 
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(355)
           "RDP_JOB_DEADLINE=$($deadline.ToString('o'))" >> $env:GITHUB_ENV
           "RDP_PHONE_IP=$phoneIP" >> $env:GITHUB_ENV
           "RDP_SESSION_MINUTES=$minutes" >> $env:GITHUB_ENV
@@ -74,7 +73,6 @@ jobs:
         run: |
           $msi = Join-Path $env:RUNNER_TEMP 'tailscale-amd64.msi'
           $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.104.5-amd64.msi'
-
           Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 90
 
           $signature = Get-AuthenticodeSignature -FilePath $msi
@@ -86,7 +84,6 @@ jobs:
           $installer = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList @(
             '/i', ('"{0}"' -f $msi), '/qn', '/norestart', 'TS_NOLAUNCH=1'
           )
-
           if ($installer.ExitCode -ne 0) {
             throw "Tailscale installation failed with code $($installer.ExitCode)."
           }
@@ -101,26 +98,23 @@ jobs:
             throw "gsudo installation failed with code $LASTEXITCODE."
           }
 
-          # Refresh PATH for verification in this workflow step.
           $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           $env:Path = "$machinePath;$env:Path"
 
           $gsudo = Get-Command gsudo.exe -ErrorAction Stop
           & $gsudo.Source --version
-
           if ($LASTEXITCODE -ne 0) {
             throw 'gsudo verification failed.'
           }
 
       - name: Check Windows Test Mode
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $bootSettings = & bcdedit.exe /enum '{current}' 2>&1
-
           if ($LASTEXITCODE -ne 0) {
             Write-Warning 'Could not read the Windows boot configuration.'
           } elseif (($bootSettings -join "`n") -match '(?im)^\s*testsigning\s+Yes\s*$') {
             & bcdedit.exe /set '{current}' testsigning off
-
             if ($LASTEXITCODE -eq 0) {
               Write-Warning 'Test signing is set to OFF. Windows requires a reboot to apply this change.'
             } else {
@@ -129,15 +123,12 @@ jobs:
           } else {
             Write-Host 'The current boot entry has no enabled test-signing flag.'
           }
-
           exit 0
 
       - name: Enable wallpaper and prepare desktop
         run: |
-          # Allow wallpaper in new RDP sessions.
           $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $rdpPolicy -Force | Out-Null
-
           New-ItemProperty -Path $rdpPolicy `
             -Name fNoRemoteDesktopWallpaper `
             -PropertyType DWord -Value 0 -Force | Out-Null
@@ -145,15 +136,12 @@ jobs:
           Set-Service -Name Themes -StartupType Automatic
           Start-Service -Name Themes
 
-          # Run the user settings inside the RDP user's own session.
           $configDirectory = Join-Path $env:ProgramData 'RdpDesktop'
           New-Item -Path $configDirectory -ItemType Directory -Force | Out-Null
-
           $scriptPath = Join-Path $configDirectory 'Initialize-Desktop.ps1'
 
           @'
           $ErrorActionPreference = 'Stop'
-
           if ($env:USERNAME -ne 'rdpdebug') {
             exit
           }
@@ -163,7 +151,6 @@ jobs:
             exit
           }
 
-          # Remove wallpaper restrictions from this user's profile.
           $activeDesktop = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\ActiveDesktop'
           Remove-ItemProperty -Path $activeDesktop `
             -Name NoChangingWallPaper -ErrorAction SilentlyContinue
@@ -174,7 +161,6 @@ jobs:
               -Name $name -ErrorAction SilentlyContinue
           }
 
-          # Select an existing Windows wallpaper for the first sign-in.
           $wallpaperDirectory = Join-Path $env:WINDIR 'Web\Wallpaper'
           $wallpaper = Get-ChildItem -Path $wallpaperDirectory -File -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in '.jpg', '.jpeg', '.bmp' } |
@@ -201,19 +187,16 @@ jobs:
             $applied = [DesktopWallpaper]::SystemParametersInfo(
               20, 0, $wallpaper.FullName, 3
             )
-
             if (-not $applied) {
               throw 'Windows could not apply the wallpaper.'
             }
           }
 
-          # Apply the defaults once so later wallpaper changes are preserved.
           New-Item -Path $marker -Force | Out-Null
           '@ | Set-Content -LiteralPath $scriptPath -Encoding UTF8
 
           $startup = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
           New-Item -Path $startup -Force | Out-Null
-
           $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
           $startupCommand = '"{0}" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}"' -f $powershell, $scriptPath
 
@@ -232,12 +215,9 @@ jobs:
           }
 
           $password = [string]$env:RDP_PASSWORD
-          if ($password.Length -lt 20 -or
-              $password.Length -gt 127 -or
-              $password -cnotmatch '[A-Z]' -or
-              $password -cnotmatch '[a-z]' -or
-              $password -notmatch '[0-9]' -or
-              $password -notmatch '[^A-Za-z0-9\s]' -or
+          if ($password.Length -lt 20 -or $password.Length -gt 127 -or
+              $password -cnotmatch '[A-Z]' -or $password -cnotmatch '[a-z]' -or
+              $password -notmatch '[0-9]' -or $password -notmatch '[^A-Za-z0-9\s]' -or
               $password -match 'rdpdebug') {
             throw 'RDP_PASSWORD must contain 20–127 characters with uppercase, lowercase, a digit, and a symbol. Avoid rdpdebug.'
           }
@@ -248,23 +228,20 @@ jobs:
 
           $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
           Start-Service -Name Tailscale
-
           $keyFile = Join-Path $env:RUNNER_TEMP ("rdp-tailnet-{0}.key" -f [guid]::NewGuid())
 
           try {
             [IO.File]::WriteAllText($keyFile, $env:TAILSCALE_AUTHKEY.Trim())
             Remove-Item Env:TAILSCALE_AUTHKEY
-
             $hostname = "gh-rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
 
             & $tailscale up "--auth-key=file:$keyFile" `
-              --unattended `
-              --accept-dns=false `
-              --accept-routes=false `
-              --shields-up=false `
+              '--unattended' `
+              '--accept-dns=false' `
+              '--accept-routes=false' `
+              '--shields-up=false' `
               "--hostname=$hostname" `
-              --timeout=90s
-
+              '--timeout=90s'
             if ($LASTEXITCODE -ne 0) {
               throw 'Tailscale sign-in failed. Check your auth key and device approval.'
             }
@@ -279,16 +256,13 @@ jobs:
 
           $runnerIP = ([string]($addresses | Select-Object -First 1)).Trim()
           $adapterDeadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
-
           do {
             $adapter = Get-NetIPAddress -IPAddress $runnerIP `
               -AddressFamily IPv4 -ErrorAction SilentlyContinue |
               Select-Object -First 1
-
             if ($adapter) {
               break
             }
-
             Start-Sleep -Seconds 2
           } while ([DateTimeOffset]::UtcNow -lt $adapterDeadline)
 
@@ -299,13 +273,11 @@ jobs:
           $user = New-LocalUser -Name rdpdebug `
             -Password $securePassword `
             -Description 'Temporary Windows project debugging account'
-
           Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $user
           Add-LocalGroupMember -SID 'S-1-5-32-555' -Member $user
 
-          Set-NetFirewallProfile -Profile Domain,Private,Public `
+          Set-NetFirewallProfile -Profile 'Domain','Private','Public' `
             -Enabled True -DefaultInboundAction Block
-
           Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue |
             Disable-NetFirewallRule
 
@@ -321,68 +293,141 @@ jobs:
             LocalAddress = $runnerIP
             RemoteAddress = $env:RDP_PHONE_IP
           }
-
           New-NetFirewallRule @firewallRule | Out-Null
 
           $terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
-
           Set-ItemProperty -LiteralPath $terminalServer `
             -Name fDenyTSConnections -Value 0
-
           Set-ItemProperty -LiteralPath "$terminalServer\WinStations\RDP-Tcp" `
             -Name UserAuthentication -Value 1
-
           Restart-Service -Name TermService -Force
 
           $listenerDeadline = [DateTimeOffset]::UtcNow.AddSeconds(45)
-
           while (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
             if ([DateTimeOffset]::UtcNow -ge $listenerDeadline) {
               throw 'Remote Desktop Services did not open port 3389.'
             }
-
             Start-Sleep -Seconds 2
           }
-
           "RDP_RUNNER_IP=$runnerIP" >> $env:GITHUB_ENV
+
+      - name: Install and enable private VNC
+        timeout-minutes: 5
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'tightvnc-setup.msi'
+          $url = 'https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi'
+          Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 90
+
+          $signature = Get-AuthenticodeSignature -FilePath $msi
+          if ($signature.Status -ne 'Valid' -or
+              $signature.SignerCertificate.Subject -notmatch 'GlavSoft') {
+            throw 'TightVNC installer signature verification failed.'
+          }
+
+          # Restrict access with a dedicated Tailscale-only firewall rule below.
+          $arguments = @(
+            '/i', ('"{0}"' -f $msi), '/qn', '/norestart'
+            'ADDLOCAL=Server'
+            'SERVER_REGISTER_AS_SERVICE=1'
+            'SERVER_ADD_FIREWALL_EXCEPTION=0'
+            'SERVER_ALLOW_SAS=1'
+            'SET_ACCEPTHTTPCONNECTIONS=1'
+            'VALUE_OF_ACCEPTHTTPCONNECTIONS=0'
+            'SET_USEVNCAUTHENTICATION=1'
+            'VALUE_OF_USEVNCAUTHENTICATION=1'
+            'SET_PASSWORD=1'
+            "VALUE_OF_PASSWORD=$env:VNC_PASSWORD"
+            'SET_RFBPORT=1'
+            'VALUE_OF_RFBPORT=5900'
+            'SET_REMOVEWALLPAPER=1'
+            'VALUE_OF_REMOVEWALLPAPER=0'
+          )
+
+          try {
+            $installer = Start-Process -FilePath 'msiexec.exe' `
+              -ArgumentList $arguments -Wait -PassThru
+            if ($installer.ExitCode -ne 0) {
+              throw "TightVNC installation failed with code $($installer.ExitCode)."
+            }
+          } finally {
+            Remove-Item Env:VNC_PASSWORD
+            Remove-Variable arguments
+            Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+          }
+
+          $adapter = Get-NetIPAddress -IPAddress $env:RDP_RUNNER_IP `
+            -AddressFamily IPv4 |
+            Select-Object -First 1
+          $vncRule = @{
+            Name = 'ProjectDebugVnc'
+            DisplayName = 'Project VNC through Tailscale'
+            Direction = 'Inbound'
+            Action = 'Allow'
+            Profile = 'Any'
+            Protocol = 'TCP'
+            LocalPort = 5900
+            InterfaceAlias = $adapter.InterfaceAlias
+            LocalAddress = $env:RDP_RUNNER_IP
+            RemoteAddress = $env:RDP_PHONE_IP
+          }
+          New-NetFirewallRule @vncRule | Out-Null
+          Start-Service -Name tvnserver
+
+          $listenerDeadline = [DateTimeOffset]::UtcNow.AddSeconds(45)
+          while (-not (Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue)) {
+            if ([DateTimeOffset]::UtcNow -ge $listenerDeadline) {
+              throw 'TightVNC did not open port 5900.'
+            }
+            Start-Sleep -Seconds 2
+          }
 
       - name: Show connection details and hold session
         run: |
           $deadline = [DateTimeOffset]::UtcNow.AddMinutes([int]$env:RDP_SESSION_MINUTES)
           $jobDeadline = [DateTimeOffset]::Parse($env:RDP_JOB_DEADLINE)
-
           if ($deadline -gt $jobDeadline) {
             $deadline = $jobDeadline
           }
 
           $username = "$env:COMPUTERNAME\rdpdebug"
-
-          Write-Host "PC address: $($env:RDP_RUNNER_IP):3389"
-          Write-Host "Username: $username"
-          Write-Host 'Password: Your RDP_PASSWORD repository secret'
+          Write-Host "RDP address: $($env:RDP_RUNNER_IP):3389"
+          Write-Host "RDP username: $username"
+          Write-Host 'RDP password: Your RDP_PASSWORD repository secret'
+          Write-Host "VNC host: $env:RDP_RUNNER_IP"
+          Write-Host 'VNC port: 5900'
+          Write-Host 'VNC password: Your VNC_PASSWORD repository secret'
+          Write-Host 'VNC shares the console desktop. For Windows sign-in, use the RDP credentials.'
           Write-Host "Scheduled end: $($deadline.ToString('u'))"
           Write-Host "Project folder: $env:GITHUB_WORKSPACE"
-          Write-Host 'For elevated Windows commands, use gsudo.'
           Write-Host 'Keep Tailscale connected. Cancel this run when finished.'
+
+          @"
+          ### RDP and VNC are ready
+
+          | Connection | Host | Port | Credentials |
+          | --- | --- | --- | --- |
+          | RDP | $env:RDP_RUNNER_IP | 3389 | $username and RDP_PASSWORD |
+          | VNC | $env:RDP_RUNNER_IP | 5900 | VNC_PASSWORD |
+          "@ >> $env:GITHUB_STEP_SUMMARY
 
           while ([DateTimeOffset]::UtcNow -lt $deadline) {
             Start-Sleep -Seconds 5
           }
 
-      - name: Close RDP and sign out
+      - name: Close RDP and VNC and sign out
         if: ${{ always() }}
         timeout-minutes: 2
         run: |
-          Remove-NetFirewallRule -Name ProjectDebugRdp -ErrorAction SilentlyContinue
-
+          Remove-NetFirewallRule -Name 'ProjectDebugRdp','ProjectDebugVnc' -ErrorAction SilentlyContinue
+          Stop-Service -Name tvnserver -Force -ErrorAction SilentlyContinue
           if (Get-LocalUser -Name rdpdebug -ErrorAction SilentlyContinue) {
             Disable-LocalUser -Name rdpdebug -ErrorAction SilentlyContinue
           }
 
           $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-
           if (Test-Path -LiteralPath $tailscale) {
             & $tailscale logout
           }
-
           exit 0
